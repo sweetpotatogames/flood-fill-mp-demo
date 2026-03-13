@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Flood-Fill Dungeon</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #080810;
+      color: #c8b99a;
+      font-family: 'Courier New', monospace;
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    #hud {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      padding: 7px 14px;
+      background: #10101c;
+      border-bottom: 1px solid #222238;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    .hud-title { font-size: 13px; font-weight: bold; color: #f0d080; letter-spacing: 2px; }
+    .hud-stat  { font-size: 11px; color: #6a5a4a; }
+    .hud-stat span { color: #c8b99a; }
+
+    #player-list { display: flex; gap: 10px; flex-wrap: wrap; margin-left: auto; }
+
+    .p-badge {
+      display: flex; align-items: center; gap: 5px;
+      font-size: 11px; padding: 2px 8px;
+      border-radius: 3px; background: #181828; border: 1px solid #282840;
+    }
+    .p-badge.me { border-color: #f0d080; color: #f0d080; }
+    .p-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+
+    #wrap { flex: 1; position: relative; overflow: hidden; }
+    canvas { display: block; width: 100%; height: 100%; }
+
+    /* Overlays */
+    .overlay {
+      position: absolute; pointer-events: none;
+      background: rgba(8,8,16,0.88); border: 1px solid #222238; border-radius: 4px;
+      padding: 9px 13px; font-size: 11px; line-height: 1.85;
+    }
+    #legend   { bottom: 12px; left: 12px; }
+    #controls { bottom: 12px; right: 12px; }
+
+    .leg-row  { display: flex; align-items: center; gap: 8px; }
+    .leg-sw   { width: 13px; height: 13px; border-radius: 2px; flex-shrink: 0; }
+    .leg-icon { width: 13px; text-align: center; font-size: 12px; }
+
+    #status {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+      font-size: 18px; color: #f0d080; text-align: center; pointer-events: none;
+    }
+    #minimap {
+      position: absolute; top: 10px; right: 10px;
+      background: rgba(8,8,16,0.9); border: 1px solid #222238; border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+
+<div id="hud">
+  <span class="hud-title">🏰 DUNGEON</span>
+  <div class="hud-stat">Rooms: <span id="s-rooms">0</span></div>
+  <div class="hud-stat">My explored: <span id="s-my">0</span></div>
+  <div class="hud-stat">Team explored: <span id="s-all">0</span></div>
+  <div class="hud-stat">Frontier: <span id="s-front">0</span></div>
+  <div class="hud-stat">Pos: <span id="s-pos">—</span></div>
+  <div id="player-list"></div>
+</div>
+
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <canvas id="minimap" width="170" height="128"></canvas>
+  <div id="status">Connecting…</div>
+
+  <div class="overlay" id="legend">
+    <div class="leg-row"><div class="leg-sw" style="background:#3d2e18;border:1px solid #7a6040"></div> My explored</div>
+    <div class="leg-row"><div class="leg-sw" style="background:#1a2030;border:1px solid #304060"></div> Teammate explored</div>
+    <div class="leg-row"><div class="leg-sw" style="background:#161620;border:1px solid #2a2a40"></div> Frontier (pre-generated)</div>
+    <div style="height:5px"></div>
+    <div class="leg-row"><div class="leg-icon">💰</div> Treasure</div>
+    <div class="leg-row"><div class="leg-icon">💀</div> Monster</div>
+    <div class="leg-row"><div class="leg-icon">⚠</div> Trap</div>
+    <div class="leg-row"><div class="leg-icon">✨</div> Shrine</div>
+    <div class="leg-row"><div class="leg-icon">🚪</div> Spawn</div>
+  </div>
+
+  <div class="overlay" id="controls">
+    <div>WASD / ↑↓←→ — Move</div>
+    <div style="color:#5a4a3a;margin-top:4px">Open tabs for more players</div>
+  </div>
+</div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────
+//  Config
+// ─────────────────────────────────────────────────────────────────
+const CELL      = 66;   // px — grid spacing
+const ROOM_SIZE = 40;   // px — room square
+const CORR_W    = 13;   // px — corridor width
+const LERP      = 0.13; // camera smoothing
+
+// ─────────────────────────────────────────────────────────────────
+//  Client-side dungeon state (accumulated from server deltas)
+// ─────────────────────────────────────────────────────────────────
+const roomMap    = new Map();   // key → Room
+const myExp      = new Set();   // rooms I've explored
+const allExp     = new Set();   // rooms any player explored
+const frontierS  = new Set();   // pre-generated, unvisited
+let   players    = [];
+let   playerId   = null;
+let   tick       = 0;
+
+// Flash animation state for newly generated rooms
+const flashMap   = new Map();   // key → expiry ms
+const FLASH_DUR  = 700;
+
+function applyState(msg) {
+  // Full snapshot (on connect / reconnect)
+  if (msg.type === 'full_state') {
+    roomMap.clear(); myExp.clear(); allExp.clear(); frontierS.clear();
+    for (const r of msg.rooms)       roomMap.set(`${r.x},${r.y}`, r);
+    for (const k of msg.myExplored)  myExp.add(k);
+    for (const k of msg.allExplored) allExp.add(k);
+    for (const k of msg.frontier)    frontierS.add(k);
+    players  = msg.players;
+    playerId = msg.playerId;
+    tick     = msg.tick;
+    return;
+  }
+  // Delta update
+  if (msg.type === 'state') {
+    const now = Date.now();
+    for (const r of msg.newRooms) {
+      const k = `${r.x},${r.y}`;
+      if (!roomMap.has(k)) {
+        roomMap.set(k, r);
+        flashMap.set(k, now + FLASH_DUR);
+      }
+    }
+    for (const k of msg.myExplored)  { myExp.add(k);     frontierS.delete(k); }
+    for (const k of msg.allExplored) { allExp.add(k);     frontierS.delete(k); }
+    for (const k of msg.frontier)    frontierS.add(k);
+    players = msg.players;
+    tick    = msg.tick;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  WebSocket
+// ─────────────────────────────────────────────────────────────────
+const ws = new WebSocket(`ws://${location.host}`);
+
+ws.addEventListener('open', () => {
+  document.getElementById('status').style.display = 'none';
+});
+ws.addEventListener('close', () => {
+  document.getElementById('status').textContent = '⚠ Disconnected — refresh to reconnect';
+  document.getElementById('status').style.display = 'block';
+});
+ws.addEventListener('message', ev => {
+  const msg = JSON.parse(ev.data);
+  applyState(msg);
+  updateHUD();
+});
+ws.addEventListener('error', console.error);
+
+// ─────────────────────────────────────────────────────────────────
+//  Input
+// ─────────────────────────────────────────────────────────────────
+const KEY_DIR = {
+  ArrowUp:'n', w:'n', W:'n',
+  ArrowDown:'s', s:'s', S:'s',
+  ArrowRight:'e', d:'e', D:'e',
+  ArrowLeft:'w', a:'w', A:'w',
+};
+const held = new Set();
+let moveInterval = null;
+
+function send(dir) {
+  if (ws.readyState === WebSocket.OPEN)
+    ws.send(JSON.stringify({ type:'move', dir }));
+}
+
+document.addEventListener('keydown', e => {
+  const dir = KEY_DIR[e.key];
+  if (!dir) return;
+  e.preventDefault();
+  if (held.has(e.key)) return;
+  held.add(e.key);
+  send(dir);
+  moveInterval = setInterval(() => { if (held.has(e.key)) send(dir); }, 160);
+});
+document.addEventListener('keyup', e => {
+  held.delete(e.key);
+  if (held.size === 0) { clearInterval(moveInterval); moveInterval = null; }
+});
+
+// ─────────────────────────────────────────────────────────────────
+//  HUD
+// ─────────────────────────────────────────────────────────────────
+function updateHUD() {
+  const me = players.find(p => p.id === playerId);
+  document.getElementById('s-rooms').textContent  = roomMap.size;
+  document.getElementById('s-my').textContent     = myExp.size;
+  document.getElementById('s-all').textContent    = allExp.size;
+  document.getElementById('s-front').textContent  = frontierS.size;
+  if (me) document.getElementById('s-pos').textContent = `(${me.x},${me.y})`;
+
+  const list = document.getElementById('player-list');
+  list.innerHTML = '';
+  for (const p of players) {
+    const b = document.createElement('div');
+    b.className = 'p-badge' + (p.id === playerId ? ' me' : '');
+    b.innerHTML = `<div class="p-dot" style="background:${p.color}"></div>${p.name}${p.id===playerId?' (you)':''}`;
+    list.appendChild(b);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Rendering
+// ─────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const mm     = document.getElementById('minimap');
+const mmCtx  = mm.getContext('2d');
+
+// Room type display config
+const ROOM_TYPE = {
+  empty:    { icon: null,  label: '' },
+  monster:  { icon: '💀', label: 'monster' },
+  treasure: { icon: '💰', label: 'treasure' },
+  trap:     { icon: '⚠',  label: 'trap' },
+  shrine:   { icon: '✨', label: 'shrine' },
+  spawn:    { icon: '🚪', label: 'spawn' },
+};
+
+// Fog layers — fog of war palette
+const LAYER = {
+  // Per-me explored
+  myRoom:    { fill: '#2e2214', stroke: '#8a6a40', floor: '#c89a5a', alpha: 0.14 },
+  // Teammate explored (dim blue)
+  teamRoom:  { fill: '#141826', stroke: '#2a3a5a', floor: '#4a6090', alpha: 0.08 },
+  // Frontier (barely visible)
+  frontRoom: { fill: '#0e0e1a', stroke: '#1e1e32', floor: null, alpha: 0 },
+};
+
+let camX = 0, camY = 0, tgtX = 0, tgtY = 0;
+
+function resize() {
+  const dpr = devicePixelRatio;
+  canvas.width  = canvas.offsetWidth  * dpr;
+  canvas.height = canvas.offsetHeight * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+function toScreen(wx, wy) {
+  const W = canvas.offsetWidth, H = canvas.offsetHeight;
+  return [W/2 + (wx - camX) * CELL, H/2 + (wy - camY) * CELL];
+}
+
+function drawRoom(sx, sy, room, layer, isMe, flashT) {
+  const half = ROOM_SIZE / 2;
+
+  // Flash pulse for newly generated rooms
+  if (flashT > 0) {
+    ctx.save();
+    ctx.globalAlpha = flashT * 0.4;
+    ctx.fillStyle = '#5050c0';
+    ctx.fillRect(sx - half - 5, sy - half - 5, ROOM_SIZE + 10, ROOM_SIZE + 10);
+    ctx.restore();
+  }
+
+  // Glow behind current player room
+  if (isMe) {
+    ctx.save();
+    const grd = ctx.createRadialGradient(sx, sy, 0, sx, sy, ROOM_SIZE);
+    grd.addColorStop(0, 'rgba(240,200,74,0.15)');
+    grd.addColorStop(1, 'transparent');
+    ctx.fillStyle = grd;
+    ctx.fillRect(sx - ROOM_SIZE, sy - ROOM_SIZE, ROOM_SIZE*2, ROOM_SIZE*2);
+    ctx.restore();
+  }
+
+  // Room body
+  ctx.fillStyle   = isMe ? '#2a1800' : layer.fill;
+  ctx.strokeStyle = isMe ? '#f0c84a' : layer.stroke;
+  ctx.lineWidth   = isMe ? 2 : 1;
+  ctx.beginPath();
+  ctx.rect(sx - half, sy - half, ROOM_SIZE, ROOM_SIZE);
+  ctx.fill();
+  ctx.stroke();
+
+  // Inner floor detail (only for explored)
+  if (layer.floor) {
+    const inner = ROOM_SIZE * 0.54;
+    ctx.fillStyle   = isMe ? '#f0c84a' : layer.floor;
+    ctx.globalAlpha = isMe ? 0.28 : layer.alpha;
+    ctx.fillRect(sx - inner/2, sy - inner/2, inner, inner);
+    ctx.globalAlpha = 1;
+  }
+
+  // Room type icon (only show in explored rooms so it's a discovery reward)
+  const explored = layer === LAYER.myRoom || layer === LAYER.teamRoom;
+  if (explored && room.type && room.type !== 'empty') {
+    const cfg = ROOM_TYPE[room.type];
+    if (cfg && cfg.icon) {
+      ctx.font = '15px serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.globalAlpha = layer === LAYER.myRoom ? 0.92 : 0.5;
+      ctx.fillText(cfg.icon, sx, sy);
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+function drawCorridor(ax, ay, bx, by, layer) {
+  const half = CORR_W / 2;
+  ctx.fillStyle = layer === LAYER.myRoom   ? '#7a5830'
+                : layer === LAYER.teamRoom ? '#1e2a3e'
+                : '#0c0c18';
+
+  if (ax === bx) {
+    const top    = Math.min(ay, by) + ROOM_SIZE / 2;
+    const bottom = Math.max(ay, by) - ROOM_SIZE / 2;
+    ctx.fillRect(ax - half, top, CORR_W, bottom - top);
+  } else {
+    const left  = Math.min(ax, bx) + ROOM_SIZE / 2;
+    const right = Math.max(ax, bx) - ROOM_SIZE / 2;
+    ctx.fillRect(left, ay - half, right - left, CORR_W);
+  }
+}
+
+function drawPlayer(sx, sy, p, isMe) {
+  const r = isMe ? 11 : 9;
+  ctx.save();
+  ctx.shadowColor = p.color;
+  ctx.shadowBlur  = isMe ? 20 : 10;
+  ctx.fillStyle   = p.color;
+  ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+
+  ctx.strokeStyle = isMe ? '#fff' : 'rgba(255,255,255,0.4)';
+  ctx.lineWidth   = isMe ? 2 : 1;
+  ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI*2); ctx.stroke();
+
+  ctx.fillStyle  = isMe ? '#f0d080' : 'rgba(200,185,154,0.65)';
+  ctx.font       = `bold ${isMe ? 11 : 10}px 'Courier New', monospace`;
+  ctx.textAlign  = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(p.name, sx, sy - r - 5);
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Minimap
+// ─────────────────────────────────────────────────────────────────
+function drawMinimap() {
+  const MW = mm.width, MH = mm.height;
+  mmCtx.fillStyle = 'rgba(8,8,16,0.95)';
+  mmCtx.fillRect(0, 0, MW, MH);
+  if (roomMap.size === 0) return;
+
+  let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
+  for (const r of roomMap.values()) {
+    minX=Math.min(minX,r.x); maxX=Math.max(maxX,r.x);
+    minY=Math.min(minY,r.y); maxY=Math.max(maxY,r.y);
+  }
+  const sc  = Math.min((MW-10)/(Math.max(maxX-minX+1,1)), (MH-10)/(Math.max(maxY-minY+1,1)), 5);
+  const ox  = (MW - (maxX-minX+1)*sc) / 2;
+  const oy  = (MH - (maxY-minY+1)*sc) / 2;
+  const dot = Math.max(1, sc - 0.5);
+
+  for (const r of roomMap.values()) {
+    const k  = `${r.x},${r.y}`;
+    const px = ox + (r.x - minX) * sc;
+    const py = oy + (r.y - minY) * sc;
+
+    // Color by fog layer
+    mmCtx.fillStyle = myExp.has(k)   ? '#c89a5a'
+                    : allExp.has(k)  ? '#2a4060'
+                    : frontierS.has(k) ? '#161620'
+                    : '#0a0a14';
+    mmCtx.fillRect(px, py, dot, dot);
+  }
+
+  // Players
+  for (const p of players) {
+    const px = ox + (p.x - minX) * sc + dot/2;
+    const py = oy + (p.y - minY) * sc + dot/2;
+    mmCtx.fillStyle = p.color;
+    mmCtx.beginPath();
+    mmCtx.arc(px, py, p.id===playerId ? 3 : 2, 0, Math.PI*2);
+    mmCtx.fill();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Main render loop
+// ─────────────────────────────────────────────────────────────────
+function render(ts) {
+  requestAnimationFrame(render);
+  const W = canvas.offsetWidth, H = canvas.offsetHeight;
+
+  // Camera follows me
+  const me = players.find(p => p.id === playerId);
+  if (me) { tgtX = me.x; tgtY = me.y; }
+  camX += (tgtX - camX) * LERP;
+  camY += (tgtY - camY) * LERP;
+
+  // Clear
+  ctx.fillStyle = '#080810';
+  ctx.fillRect(0, 0, W, H);
+
+  if (!playerId) return;
+
+  // Frustum cull
+  const pad = 2;
+  const minWX = camX - W/2/CELL - pad, maxWX = camX + W/2/CELL + pad;
+  const minWY = camY - H/2/CELL - pad, maxWY = camY + H/2/CELL + pad;
+
+  const visible = [];
+  for (const r of roomMap.values()) {
+    if (r.x >= minWX && r.x <= maxWX && r.y >= minWY && r.y <= maxWY) visible.push(r);
+  }
+
+  // Determine fog layer per room
+  function layerFor(k) {
+    if (myExp.has(k))   return LAYER.myRoom;
+    if (allExp.has(k))  return LAYER.teamRoom;
+    if (frontierS.has(k)) return LAYER.frontRoom;
+    return null;
+  }
+
+  // ── Corridors first ──
+  for (const room of visible) {
+    const k  = `${room.x},${room.y}`;
+    const la = layerFor(k);
+    if (!la) continue;
+    const [sx, sy] = toScreen(room.x, room.y);
+
+    for (const dir of room.exits) {
+      const [dx,dy] = {n:[0,-1],s:[0,1],e:[1,0],w:[-1,0]}[dir];
+      const nk = `${room.x+dx},${room.y+dy}`;
+      if (!roomMap.has(nk)) continue;
+      // Canonical dedup
+      if (room.x > room.x+dx || (room.x===room.x+dx && room.y > room.y+dy)) continue;
+      const lb = layerFor(nk);
+      if (!lb) continue;
+      const [ex, ey] = toScreen(room.x+dx, room.y+dy);
+      // Corridor uses the "brighter" of the two rooms' layers
+      const corrLayer = (la === LAYER.myRoom || lb === LAYER.myRoom) ? LAYER.myRoom
+                      : (la === LAYER.teamRoom || lb === LAYER.teamRoom) ? LAYER.teamRoom
+                      : LAYER.frontRoom;
+      drawCorridor(sx, sy, ex, ey, corrLayer);
+    }
+  }
+
+  // ── Rooms ──
+  for (const room of visible) {
+    const k  = `${room.x},${room.y}`;
+    const la = layerFor(k);
+    if (!la) continue;
+    const [sx, sy] = toScreen(room.x, room.y);
+    const isMe = me ? (me.x === room.x && me.y === room.y) : false;
+    const expiry = flashMap.get(k) || 0;
+    const flashT = Math.max(0, (expiry - ts) / FLASH_DUR);
+    if (flashT === 0 && flashMap.has(k)) flashMap.delete(k);
+    drawRoom(sx, sy, room, la, isMe, flashT);
+  }
+
+  // ── Players ──
+  for (const p of players) {
+    const [sx, sy] = toScreen(p.x, p.y);
+    if (sx < -20 || sx > W+20 || sy < -20 || sy > H+20) continue;
+    drawPlayer(sx, sy, p, p.id === playerId);
+  }
+
+  // ── Minimap ──
+  drawMinimap();
+}
+
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
