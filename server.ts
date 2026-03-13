@@ -295,7 +295,7 @@ const clients = new Map<string, WebSocket>();
 const httpServer = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/index.html') {
     try {
-      const html = fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8');
+      const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end(html);
     } catch {
