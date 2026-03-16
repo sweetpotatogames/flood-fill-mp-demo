@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Flood-Fill Dungeon</title>
+  <title>Flood-Fill Dungeon — Room Templates</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -44,7 +44,6 @@
     #wrap { flex: 1; position: relative; overflow: hidden; }
     #c { display: block; width: 100%; height: 100%; }
 
-    /* Overlays */
     .overlay {
       position: absolute; pointer-events: none;
       background: rgba(8,8,16,0.88); border: 1px solid #222238; border-radius: 4px;
@@ -76,12 +75,13 @@
   <div class="hud-stat">Team explored: <span id="s-all">0</span></div>
   <div class="hud-stat">Frontier: <span id="s-front">0</span></div>
   <div class="hud-stat">Pos: <span id="s-pos">—</span></div>
+  <div class="hud-stat">Room: <span id="s-room">—</span></div>
   <div id="player-list"></div>
 </div>
 
 <div id="wrap">
   <canvas id="c"></canvas>
-  <canvas id="minimap" width="170" height="128"></canvas>
+  <canvas id="minimap" width="180" height="140"></canvas>
   <div id="status">Connecting…</div>
 
   <div class="overlay" id="legend">
@@ -106,54 +106,56 @@
 // ─────────────────────────────────────────────────────────────────
 //  Config
 // ─────────────────────────────────────────────────────────────────
-const CELL      = 66;   // px — grid spacing
-const ROOM_SIZE = 40;   // px — room square
-const CORR_W    = 13;   // px — corridor width
+const CELL      = 66;   // px — grid spacing per cell
+const CELL_PAD  = 2;    // px — gap between cells in same room (floor seam)
 const LERP      = 0.13; // camera smoothing
+const FLASH_DUR = 700;  // ms — flash on new room generation
+
+const DIR_OFFSETS = { n:[0,-1], s:[0,1], e:[1,0], w:[-1,0] };
+const OPPOSITE    = { n:'s', s:'n', e:'w', w:'e' };
 
 // ─────────────────────────────────────────────────────────────────
-//  Client-side dungeon state (accumulated from server deltas)
+//  Client-side state
 // ─────────────────────────────────────────────────────────────────
-const roomMap    = new Map();   // key → Room
-const myExp      = new Set();   // rooms I've explored
-const allExp     = new Set();   // rooms any player explored
-const frontierS  = new Set();   // pre-generated, unvisited
-let   players    = [];
-let   playerId   = null;
-let   tick       = 0;
+const roomMap      = new Map();   // roomId → room data
+const cellToRoomId = new Map();   // "x,y" → roomId
+const myExp        = new Set();   // roomIds I've explored
+const allExp       = new Set();   // roomIds any player explored
+const frontierS    = new Set();   // roomIds generated, not yet visited
+let   players      = [];
+let   playerId     = null;
+let   tick         = 0;
 
-// Flash animation state for newly generated rooms
-const flashMap   = new Map();   // key → expiry ms
-const FLASH_DUR  = 700;
+// Flash animation
+const flashMap = new Map();   // roomId → expiry ms
 
 function applyState(msg) {
-  // Full snapshot (on connect / reconnect)
   if (msg.type === 'full_state') {
-    roomMap.clear(); myExp.clear(); allExp.clear(); frontierS.clear();
-    for (const r of msg.rooms)       roomMap.set(`${r.x},${r.y}`, r);
-    for (const k of msg.myExplored)  myExp.add(k);
-    for (const k of msg.allExplored) allExp.add(k);
-    for (const k of msg.frontier)    frontierS.add(k);
+    roomMap.clear(); cellToRoomId.clear();
+    myExp.clear(); allExp.clear(); frontierS.clear();
+
+    for (const r of msg.rooms) {
+      roomMap.set(r.roomId, r);
+      for (const [cx, cy] of r.cells) {
+        cellToRoomId.set(`${cx},${cy}`, r.roomId);
+      }
+    }
+
+    // Detect new rooms for flash
+    const now = Date.now();
+    for (const r of msg.rooms) {
+      if (!flashMap.has(r.roomId)) {
+        // On first full_state, don't flash everything
+        if (playerId !== null) flashMap.set(r.roomId, now + FLASH_DUR);
+      }
+    }
+
+    for (const k of msg.myExploredRooms)  myExp.add(k);
+    for (const k of msg.allExploredRooms) allExp.add(k);
+    for (const k of msg.frontierRooms)    frontierS.add(k);
     players  = msg.players;
     playerId = msg.playerId;
     tick     = msg.tick;
-    return;
-  }
-  // Delta update
-  if (msg.type === 'state') {
-    const now = Date.now();
-    for (const r of msg.newRooms) {
-      const k = `${r.x},${r.y}`;
-      if (!roomMap.has(k)) {
-        roomMap.set(k, r);
-        flashMap.set(k, now + FLASH_DUR);
-      }
-    }
-    for (const k of msg.myExplored)  { myExp.add(k);     frontierS.delete(k); }
-    for (const k of msg.allExplored) { allExp.add(k);     frontierS.delete(k); }
-    for (const k of msg.frontier)    frontierS.add(k);
-    players = msg.players;
-    tick    = msg.tick;
   }
 }
 
@@ -170,8 +172,18 @@ ws.addEventListener('close', () => {
   document.getElementById('status').style.display = 'block';
 });
 ws.addEventListener('message', ev => {
+  const prevRoomIds = new Set(roomMap.keys());
   const msg = JSON.parse(ev.data);
   applyState(msg);
+
+  // Flash newly added rooms
+  const now = Date.now();
+  for (const rid of roomMap.keys()) {
+    if (!prevRoomIds.has(rid) && !flashMap.has(rid)) {
+      flashMap.set(rid, now + FLASH_DUR);
+    }
+  }
+
   updateHUD();
 });
 ws.addEventListener('error', console.error);
@@ -216,7 +228,12 @@ function updateHUD() {
   document.getElementById('s-my').textContent     = myExp.size;
   document.getElementById('s-all').textContent    = allExp.size;
   document.getElementById('s-front').textContent  = frontierS.size;
-  if (me) document.getElementById('s-pos').textContent = `(${me.x},${me.y})`;
+  if (me) {
+    document.getElementById('s-pos').textContent = `(${me.x},${me.y})`;
+    const rid = cellToRoomId.get(`${me.x},${me.y}`);
+    const room = rid ? roomMap.get(rid) : null;
+    document.getElementById('s-room').textContent = room ? `${room.templateId}` : '—';
+  }
 
   const list = document.getElementById('player-list');
   list.innerHTML = '';
@@ -236,7 +253,6 @@ const ctx    = canvas.getContext('2d');
 const mm     = document.getElementById('minimap');
 const mmCtx  = mm.getContext('2d');
 
-// Room type display config
 const ROOM_TYPE = {
   empty:    { icon: null,  label: '' },
   monster:  { icon: '💀', label: 'monster' },
@@ -246,14 +262,10 @@ const ROOM_TYPE = {
   spawn:    { icon: '🚪', label: 'spawn' },
 };
 
-// Fog layers — fog of war palette
 const LAYER = {
-  // Per-me explored
-  myRoom:    { fill: '#2e2214', stroke: '#8a6a40', floor: '#c89a5a', alpha: 0.14 },
-  // Teammate explored (dim blue)
-  teamRoom:  { fill: '#141826', stroke: '#2a3a5a', floor: '#4a6090', alpha: 0.08 },
-  // Frontier (barely visible)
-  frontRoom: { fill: '#0e0e1a', stroke: '#1e1e32', floor: null, alpha: 0 },
+  myRoom:    { fill: '#2e2214', stroke: '#8a6a40', floor: '#c89a5a', wallOuter: '#5a4020', alpha: 0.14 },
+  teamRoom:  { fill: '#141826', stroke: '#2a3a5a', floor: '#4a6090', wallOuter: '#1a2a40', alpha: 0.08 },
+  frontRoom: { fill: '#0e0e1a', stroke: '#1e1e32', floor: null, wallOuter: '#12121e', alpha: 0 },
 };
 
 let camX = 0, camY = 0, tgtX = 0, tgtY = 0;
@@ -272,76 +284,245 @@ function toScreen(wx, wy) {
   return [W/2 + (wx - camX) * CELL, H/2 + (wy - camY) * CELL];
 }
 
-function drawRoom(sx, sy, room, layer, isMe, flashT) {
-  const half = ROOM_SIZE / 2;
+/** Determine fog layer for a room */
+function layerForRoom(roomId) {
+  if (myExp.has(roomId))      return LAYER.myRoom;
+  if (allExp.has(roomId))     return LAYER.teamRoom;
+  if (frontierS.has(roomId))  return LAYER.frontRoom;
+  return null;
+}
 
-  // Flash pulse for newly generated rooms
-  if (flashT > 0) {
-    ctx.save();
-    ctx.globalAlpha = flashT * 0.4;
-    ctx.fillStyle = '#5050c0';
-    ctx.fillRect(sx - half - 5, sy - half - 5, ROOM_SIZE + 10, ROOM_SIZE + 10);
-    ctx.restore();
+/** Build a set of "cellKey:face" strings for all internal edges within a room */
+function internalEdges(room) {
+  const cellSet = new Set();
+  for (const [cx, cy] of room.cells) cellSet.add(`${cx},${cy}`);
+
+  const internal = new Set();
+  for (const [cx, cy] of room.cells) {
+    for (const [dir, [dx, dy]] of Object.entries(DIR_OFFSETS)) {
+      if (cellSet.has(`${cx+dx},${cy+dy}`)) {
+        internal.add(`${cx},${cy}:${dir}`);
+      }
+    }
+  }
+  return internal;
+}
+
+/** Check if a face of a cell is a connector (door) */
+function isConnectorFace(room, cx, cy, face) {
+  return room.connectors.some(c => c.cellX === cx && c.cellY === cy && c.face === face);
+}
+
+/** Check if a connector is linked */
+function isLinkedConnector(room, cx, cy, face) {
+  return room.connectors.some(c => c.cellX === cx && c.cellY === cy && c.face === face && c.linkedRoomId !== null);
+}
+
+function drawMultiCellRoom(room, layer, meCell, ts) {
+  const internal = internalEdges(room);
+  const cellSize = CELL - CELL_PAD * 2;
+  const halfCell = cellSize / 2;
+  const isPlayerRoom = meCell !== null;
+
+  // Flash
+  const expiry = flashMap.get(room.roomId) || 0;
+  const flashT = Math.max(0, (expiry - ts) / FLASH_DUR);
+  if (flashT === 0 && flashMap.has(room.roomId)) flashMap.delete(room.roomId);
+
+  // === Draw filled cells ===
+  for (const [cx, cy] of room.cells) {
+    const [sx, sy] = toScreen(cx, cy);
+    const isMe = meCell && cx === meCell[0] && cy === meCell[1];
+
+    // Flash pulse
+    if (flashT > 0) {
+      ctx.save();
+      ctx.globalAlpha = flashT * 0.35;
+      ctx.fillStyle = '#5050c0';
+      ctx.fillRect(sx - halfCell - 4, sy - halfCell - 4, cellSize + 8, cellSize + 8);
+      ctx.restore();
+    }
+
+    // Glow for player's cell
+    if (isMe) {
+      ctx.save();
+      const grd = ctx.createRadialGradient(sx, sy, 0, sx, sy, CELL * 1.2);
+      grd.addColorStop(0, 'rgba(240,200,74,0.12)');
+      grd.addColorStop(1, 'transparent');
+      ctx.fillStyle = grd;
+      ctx.fillRect(sx - CELL * 1.5, sy - CELL * 1.5, CELL * 3, CELL * 3);
+      ctx.restore();
+    }
+
+    // Cell fill
+    ctx.fillStyle = isMe ? '#2a1800' : (isPlayerRoom ? '#241a0e' : layer.fill);
+    ctx.fillRect(sx - halfCell, sy - halfCell, cellSize, cellSize);
+
+    // Floor detail (explored rooms)
+    if (layer.floor) {
+      const inner = cellSize * 0.5;
+      ctx.fillStyle   = isMe ? '#f0c84a' : layer.floor;
+      ctx.globalAlpha = isMe ? 0.22 : layer.alpha;
+      ctx.fillRect(sx - inner/2, sy - inner/2, inner, inner);
+      ctx.globalAlpha = 1;
+    }
   }
 
-  // Glow behind current player room
-  if (isMe) {
-    ctx.save();
-    const grd = ctx.createRadialGradient(sx, sy, 0, sx, sy, ROOM_SIZE);
-    grd.addColorStop(0, 'rgba(240,200,74,0.15)');
-    grd.addColorStop(1, 'transparent');
-    ctx.fillStyle = grd;
-    ctx.fillRect(sx - ROOM_SIZE, sy - ROOM_SIZE, ROOM_SIZE*2, ROOM_SIZE*2);
-    ctx.restore();
+  // === Fill internal seams (remove gaps between cells in same room) ===
+  for (const [cx, cy] of room.cells) {
+    const [sx, sy] = toScreen(cx, cy);
+    const fillColor = isPlayerRoom ? '#241a0e' : layer.fill;
+
+    for (const [dir, [dx, dy]] of Object.entries(DIR_OFFSETS)) {
+      if (internal.has(`${cx},${cy}:${dir}`)) {
+        ctx.fillStyle = fillColor;
+        if (dir === 'e') {
+          ctx.fillRect(sx + halfCell, sy - halfCell, CELL_PAD * 2, cellSize);
+        } else if (dir === 's') {
+          ctx.fillRect(sx - halfCell, sy + halfCell, cellSize, CELL_PAD * 2);
+        }
+      }
+    }
   }
 
-  // Room body
-  ctx.fillStyle   = isMe ? '#2a1800' : layer.fill;
-  ctx.strokeStyle = isMe ? '#f0c84a' : layer.stroke;
-  ctx.lineWidth   = isMe ? 2 : 1;
-  ctx.beginPath();
-  ctx.rect(sx - half, sy - half, ROOM_SIZE, ROOM_SIZE);
-  ctx.fill();
-  ctx.stroke();
+  // === Draw walls (outer edges only) ===
+  ctx.lineWidth = 2;
+  for (const [cx, cy] of room.cells) {
+    const [sx, sy] = toScreen(cx, cy);
 
-  // Inner floor detail (only for explored)
-  if (layer.floor) {
-    const inner = ROOM_SIZE * 0.54;
-    ctx.fillStyle   = isMe ? '#f0c84a' : layer.floor;
-    ctx.globalAlpha = isMe ? 0.28 : layer.alpha;
-    ctx.fillRect(sx - inner/2, sy - inner/2, inner, inner);
-    ctx.globalAlpha = 1;
+    for (const [dir, [dx, dy]] of Object.entries(DIR_OFFSETS)) {
+      // Skip internal edges (no wall between cells in same room)
+      if (internal.has(`${cx},${cy}:${dir}`)) continue;
+
+      const isConn = isConnectorFace(room, cx, cy, dir);
+      const isLinked = isLinkedConnector(room, cx, cy, dir);
+
+      if (isConn && isLinked) {
+        // Linked door — draw door indicator
+        ctx.strokeStyle = '#d4a04a';
+        ctx.lineWidth = 2;
+        drawEdge(ctx, sx, sy, halfCell, dir, true);
+      } else if (isConn && !isLinked) {
+        // Unlinked connector — potential door (dim)
+        ctx.strokeStyle = '#4a3a2a';
+        ctx.lineWidth = 1;
+        drawEdge(ctx, sx, sy, halfCell, dir, true);
+      } else {
+        // Solid wall
+        ctx.strokeStyle = isPlayerRoom ? '#f0c84a' : layer.stroke;
+        ctx.lineWidth = isPlayerRoom ? 2 : 1.5;
+        drawEdge(ctx, sx, sy, halfCell, dir, false);
+      }
+    }
   }
 
-  // Room type icon (only show in explored rooms so it's a discovery reward)
+  // === Room type icon at anchor ===
   const explored = layer === LAYER.myRoom || layer === LAYER.teamRoom;
   if (explored && room.type && room.type !== 'empty') {
     const cfg = ROOM_TYPE[room.type];
     if (cfg && cfg.icon) {
-      ctx.font = '15px serif';
+      // Draw at the center of the room's bounding box
+      let sumX = 0, sumY = 0;
+      for (const [cx, cy] of room.cells) { sumX += cx; sumY += cy; }
+      const centerX = sumX / room.cells.length;
+      const centerY = sumY / room.cells.length;
+      const [ix, iy] = toScreen(centerX, centerY);
+
+      ctx.font = room.cells.length > 4 ? '22px serif' : '15px serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.globalAlpha = layer === LAYER.myRoom ? 0.92 : 0.5;
-      ctx.fillText(cfg.icon, sx, sy);
+      ctx.fillText(cfg.icon, ix, iy);
       ctx.globalAlpha = 1;
     }
   }
 }
 
-function drawCorridor(ax, ay, bx, by, layer) {
-  const half = CORR_W / 2;
-  ctx.fillStyle = layer === LAYER.myRoom   ? '#7a5830'
-                : layer === LAYER.teamRoom ? '#1e2a3e'
-                : '#0c0c18';
+/** Draw one edge of a cell */
+function drawEdge(ctx, sx, sy, half, dir, isDoor) {
+  const doorGap = isDoor ? half * 0.35 : 0;
+  ctx.beginPath();
 
-  if (ax === bx) {
-    const top    = Math.min(ay, by) + ROOM_SIZE / 2;
-    const bottom = Math.max(ay, by) - ROOM_SIZE / 2;
-    ctx.fillRect(ax - half, top, CORR_W, bottom - top);
-  } else {
-    const left  = Math.min(ax, bx) + ROOM_SIZE / 2;
-    const right = Math.max(ax, bx) - ROOM_SIZE / 2;
-    ctx.fillRect(left, ay - half, right - left, CORR_W);
+  if (dir === 'n') {
+    if (isDoor) {
+      ctx.moveTo(sx - half, sy - half);
+      ctx.lineTo(sx - doorGap, sy - half);
+      ctx.moveTo(sx + doorGap, sy - half);
+      ctx.lineTo(sx + half, sy - half);
+    } else {
+      ctx.moveTo(sx - half, sy - half);
+      ctx.lineTo(sx + half, sy - half);
+    }
+  } else if (dir === 's') {
+    if (isDoor) {
+      ctx.moveTo(sx - half, sy + half);
+      ctx.lineTo(sx - doorGap, sy + half);
+      ctx.moveTo(sx + doorGap, sy + half);
+      ctx.lineTo(sx + half, sy + half);
+    } else {
+      ctx.moveTo(sx - half, sy + half);
+      ctx.lineTo(sx + half, sy + half);
+    }
+  } else if (dir === 'w') {
+    if (isDoor) {
+      ctx.moveTo(sx - half, sy - half);
+      ctx.lineTo(sx - half, sy - doorGap);
+      ctx.moveTo(sx - half, sy + doorGap);
+      ctx.lineTo(sx - half, sy + half);
+    } else {
+      ctx.moveTo(sx - half, sy - half);
+      ctx.lineTo(sx - half, sy + half);
+    }
+  } else if (dir === 'e') {
+    if (isDoor) {
+      ctx.moveTo(sx + half, sy - half);
+      ctx.lineTo(sx + half, sy - doorGap);
+      ctx.moveTo(sx + half, sy + doorGap);
+      ctx.lineTo(sx + half, sy + half);
+    } else {
+      ctx.moveTo(sx + half, sy - half);
+      ctx.lineTo(sx + half, sy + half);
+    }
+  }
+  ctx.stroke();
+}
+
+/** Draw corridor between linked rooms across connector boundary */
+function drawConnectorPassage(room, layer) {
+  for (const conn of room.connectors) {
+    if (!conn.linkedRoomId) continue;
+    // Only draw from the "lower" roomId to avoid double-drawing
+    if (conn.linkedRoomId < room.roomId) continue;
+
+    const linkedLayer = layerForRoom(conn.linkedRoomId);
+    if (!linkedLayer) continue;
+
+    const [dx, dy] = DIR_OFFSETS[conn.face];
+    const [sx, sy] = toScreen(conn.cellX, conn.cellY);
+    const [tx, ty] = toScreen(conn.cellX + dx, conn.cellY + dy);
+
+    // Draw a small corridor between the two cells
+    const corrW = 12;
+    const half = corrW / 2;
+    const bestLayer = (layer === LAYER.myRoom || linkedLayer === LAYER.myRoom) ? LAYER.myRoom
+                    : (layer === LAYER.teamRoom || linkedLayer === LAYER.teamRoom) ? LAYER.teamRoom
+                    : LAYER.frontRoom;
+
+    ctx.fillStyle = bestLayer === LAYER.myRoom   ? '#5a4020'
+                  : bestLayer === LAYER.teamRoom ? '#1a2838'
+                  : '#0c0c18';
+
+    const cellHalf = (CELL - CELL_PAD * 2) / 2;
+
+    if (conn.face === 'e' || conn.face === 'w') {
+      const left  = Math.min(sx, tx) + cellHalf;
+      const right = Math.max(sx, tx) - cellHalf;
+      ctx.fillRect(left, Math.min(sy, ty) - half, right - left, corrW);
+    } else {
+      const top    = Math.min(sy, ty) + cellHalf;
+      const bottom = Math.max(sy, ty) - cellHalf;
+      ctx.fillRect(Math.min(sx, tx) - half, top, corrW, bottom - top);
+    }
   }
 }
 
@@ -374,27 +555,37 @@ function drawMinimap() {
   mmCtx.fillRect(0, 0, MW, MH);
   if (roomMap.size === 0) return;
 
+  // Collect all cells
   let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
-  for (const r of roomMap.values()) {
-    minX=Math.min(minX,r.x); maxX=Math.max(maxX,r.x);
-    minY=Math.min(minY,r.y); maxY=Math.max(maxY,r.y);
+  for (const room of roomMap.values()) {
+    for (const [cx, cy] of room.cells) {
+      minX=Math.min(minX,cx); maxX=Math.max(maxX,cx);
+      minY=Math.min(minY,cy); maxY=Math.max(maxY,cy);
+    }
   }
-  const sc  = Math.min((MW-10)/(Math.max(maxX-minX+1,1)), (MH-10)/(Math.max(maxY-minY+1,1)), 5);
-  const ox  = (MW - (maxX-minX+1)*sc) / 2;
-  const oy  = (MH - (maxY-minY+1)*sc) / 2;
+
+  const rangeX = maxX - minX + 1;
+  const rangeY = maxY - minY + 1;
+  const sc  = Math.min((MW-10)/Math.max(rangeX,1), (MH-10)/Math.max(rangeY,1), 5);
+  const ox  = (MW - rangeX * sc) / 2;
+  const oy  = (MH - rangeY * sc) / 2;
   const dot = Math.max(1, sc - 0.5);
 
-  for (const r of roomMap.values()) {
-    const k  = `${r.x},${r.y}`;
-    const px = ox + (r.x - minX) * sc;
-    const py = oy + (r.y - minY) * sc;
+  for (const room of roomMap.values()) {
+    const layer = layerForRoom(room.roomId);
+    if (!layer) continue;
 
-    // Color by fog layer
-    mmCtx.fillStyle = myExp.has(k)   ? '#c89a5a'
-                    : allExp.has(k)  ? '#2a4060'
-                    : frontierS.has(k) ? '#161620'
-                    : '#0a0a14';
-    mmCtx.fillRect(px, py, dot, dot);
+    const col = myExp.has(room.roomId)      ? '#c89a5a'
+              : allExp.has(room.roomId)     ? '#2a4060'
+              : frontierS.has(room.roomId)  ? '#1a1a28'
+              : '#0a0a14';
+
+    for (const [cx, cy] of room.cells) {
+      const px = ox + (cx - minX) * sc;
+      const py = oy + (cy - minY) * sc;
+      mmCtx.fillStyle = col;
+      mmCtx.fillRect(px, py, dot, dot);
+    }
   }
 
   // Players
@@ -415,81 +606,56 @@ function render(ts) {
   requestAnimationFrame(render);
   const W = canvas.offsetWidth, H = canvas.offsetHeight;
 
-  // Camera follows me
   const me = players.find(p => p.id === playerId);
   if (me) { tgtX = me.x; tgtY = me.y; }
   camX += (tgtX - camX) * LERP;
   camY += (tgtY - camY) * LERP;
 
-  // Clear
   ctx.fillStyle = '#080810';
   ctx.fillRect(0, 0, W, H);
 
   if (!playerId) return;
 
-  // Frustum cull
-  const pad = 2;
+  // Frustum cull — determine which rooms have visible cells
+  const pad = 3;
   const minWX = camX - W/2/CELL - pad, maxWX = camX + W/2/CELL + pad;
   const minWY = camY - H/2/CELL - pad, maxWY = camY + H/2/CELL + pad;
 
-  const visible = [];
-  for (const r of roomMap.values()) {
-    if (r.x >= minWX && r.x <= maxWX && r.y >= minWY && r.y <= maxWY) visible.push(r);
-  }
-
-  // Determine fog layer per room
-  function layerFor(k) {
-    if (myExp.has(k))   return LAYER.myRoom;
-    if (allExp.has(k))  return LAYER.teamRoom;
-    if (frontierS.has(k)) return LAYER.frontRoom;
-    return null;
-  }
-
-  // ── Corridors first ──
-  for (const room of visible) {
-    const k  = `${room.x},${room.y}`;
-    const la = layerFor(k);
-    if (!la) continue;
-    const [sx, sy] = toScreen(room.x, room.y);
-
-    for (const dir of room.exits) {
-      const [dx,dy] = {n:[0,-1],s:[0,1],e:[1,0],w:[-1,0]}[dir];
-      const nk = `${room.x+dx},${room.y+dy}`;
-      if (!roomMap.has(nk)) continue;
-      // Canonical dedup
-      if (room.x > room.x+dx || (room.x===room.x+dx && room.y > room.y+dy)) continue;
-      const lb = layerFor(nk);
-      if (!lb) continue;
-      const [ex, ey] = toScreen(room.x+dx, room.y+dy);
-      // Corridor uses the "brighter" of the two rooms' layers
-      const corrLayer = (la === LAYER.myRoom || lb === LAYER.myRoom) ? LAYER.myRoom
-                      : (la === LAYER.teamRoom || lb === LAYER.teamRoom) ? LAYER.teamRoom
-                      : LAYER.frontRoom;
-      drawCorridor(sx, sy, ex, ey, corrLayer);
+  const visibleRooms = [];
+  for (const room of roomMap.values()) {
+    let vis = false;
+    for (const [cx, cy] of room.cells) {
+      if (cx >= minWX && cx <= maxWX && cy >= minWY && cy <= maxWY) { vis = true; break; }
     }
+    if (vis) visibleRooms.push(room);
   }
 
-  // ── Rooms ──
-  for (const room of visible) {
-    const k  = `${room.x},${room.y}`;
-    const la = layerFor(k);
-    if (!la) continue;
-    const [sx, sy] = toScreen(room.x, room.y);
-    const isMe = me ? (me.x === room.x && me.y === room.y) : false;
-    const expiry = flashMap.get(k) || 0;
-    const flashT = Math.max(0, (expiry - ts) / FLASH_DUR);
-    if (flashT === 0 && flashMap.has(k)) flashMap.delete(k);
-    drawRoom(sx, sy, room, la, isMe, flashT);
+  // Find player's cell
+  const meCell = me ? [me.x, me.y] : null;
+  const meRoomId = me ? cellToRoomId.get(`${me.x},${me.y}`) : null;
+
+  // Draw connector passages first (behind rooms)
+  for (const room of visibleRooms) {
+    const layer = layerForRoom(room.roomId);
+    if (!layer) continue;
+    drawConnectorPassage(room, layer);
   }
 
-  // ── Players ──
+  // Draw rooms
+  for (const room of visibleRooms) {
+    const layer = layerForRoom(room.roomId);
+    if (!layer) continue;
+    const isPlayerRoom = room.roomId === meRoomId;
+    drawMultiCellRoom(room, layer, isPlayerRoom ? meCell : null, ts);
+  }
+
+  // Draw players
   for (const p of players) {
     const [sx, sy] = toScreen(p.x, p.y);
     if (sx < -20 || sx > W+20 || sy < -20 || sy > H+20) continue;
     drawPlayer(sx, sy, p, p.id === playerId);
   }
 
-  // ── Minimap ──
   drawMinimap();
 }
 

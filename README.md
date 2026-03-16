@@ -1,7 +1,7 @@
 # Flood-Fill Dungeon Generator — Multiplayer PoC
 
-A TypeScript proof-of-concept for a **lazy, flood-fill dungeon generator** designed for multiplayer games.  
-The dungeon has no fixed size — it grows in real time as players explore.
+A TypeScript proof-of-concept for a **lazy, room-template flood-fill dungeon generator** designed for multiplayer games.
+The dungeon has no fixed size — it grows in real time as players explore, placing **multi-cell room templates** (tetromino-like shapes) that connect through doors.
 
 ## Quick Start
 
@@ -12,52 +12,53 @@ npm start
 # → Server running at http://localhost:3000
 ```
 
-Open **multiple browser tabs** to simulate multiple players.  
+Open **multiple browser tabs** to simulate multiple players.
 Use **WASD** or **arrow keys** to move.
 
 ## How the Algorithm Works
 
 ### Core idea
 
-The dungeon is an infinite 2D grid.  No room exists until a player gets close.  
-When a player steps into a room, a **BFS flood-fill** runs outward, guaranteeing that
-all rooms within **2 hops** are generated before the player can reach them.
+The dungeon uses a cell grid as its spatial backbone. Each **room** is a **template** occupying multiple grid cells (L-shapes, T-shapes, corridors, halls). Rooms connect through **connectors** — doors on specific cell edges.
 
-```
-Player at ★ — rooms marked with their hop distance:
+Players move cell-by-cell. Movement within a room is free; crossing between rooms requires stepping through a linked connector (door). When a player enters a new room, a **BFS flood-fill** generates rooms at unlinked connectors up to 2 hops ahead.
 
-        [2] [2] [2]
-        [2] [1] [2]
-        [2] [1] [2]
-        [2] ★  [2]
-        [2] [1] [2]
-        [2] [2] [2]
-```
+### Room Templates
 
-Rooms inside the radius become **frontier** (generated, not yet visited).  
-Rooms the player has walked into become **explored**.
+~15 pre-authored templates including all rotational variants:
+
+| Template | Cells | Description |
+|----------|-------|-------------|
+| `hub_1x1` | 1 | Single cell with 4 connectors (crossroads) |
+| `corr_h`, `corr_v` | 2 | Short corridors (horizontal/vertical) |
+| `long_h`, `long_v` | 3 | Long corridors |
+| `L_0` – `L_270` | 3 | L-shapes (4 rotations) |
+| `T_0` – `T_270` | 4 | T-shapes (4 rotations) |
+| `sq_2x2` | 4 | Square room |
+| `hall_3x3` | 9 | Large hall (hub room) |
+| `dead_n/s/e/w` | 1 | Dead-end fallback (single connector) |
+
+### Placement algorithm
+
+When the flood-fill reaches an unlinked connector:
+
+1. Compute the **target cell** on the other side of the connector
+2. If already occupied, try to link back-connectors between rooms
+3. Generate a **deterministic seed** from the world position + face direction
+4. Build a **candidate list** of (template, connectorIdx) pairs with matching opposite face
+5. **Shuffle candidates** using the seed, try each — first fit with no cell overlaps wins
+6. If nothing fits, place a 1×1 **dead-end fallback**
 
 ### Deterministic layout
 
-Every room's exits are computed from a hash of its coordinates, so:
-
-- The same `(x, y)` always produces the same exits.  
-- `hasPassage(A, B) === hasPassage(B, A)` — both sides of a wall always agree.
-- No global state is needed; rooms can be generated in any order.
-
-```typescript
-function hasPassage(ax, ay, bx, by): boolean {
-  // Canonical ordering → same result regardless of which side asks
-  const h = hash32(x1 * 83492791 ^ y1 * 73856093 ^ x2 * 15485863 ^ y2 * 19349663);
-  return (h % 100) < 65;   // 65 % of walls are open
-}
-```
+Template selection is seeded from `hash32(cellX * 83492791 ^ cellY * 73856093 ^ FACE_HASH[face])`, depending only on world position + face direction. The same exploration produces the same layout regardless of which player discovers it first.
 
 ### Multiplayer sync
 
-- Server holds the single source of truth (`rooms`, `players`, `explored`, `frontier`).
-- Every player move triggers `floodGenerate()` then broadcasts the full state to all clients.
-- New rooms flash blue on all screens so players can see the dungeon expanding.
+- Server holds the single source of truth (`roomGraph`, `cellToRoom`, `players`, `explored`, `frontier`)
+- Every player move triggers `floodGenerateRooms()` then broadcasts full state to all clients
+- New rooms flash blue on all screens so players can see the dungeon expanding
+- Gap-filling generates corridors between nearby players via greedy best-first search
 
 ## Porting to Godot
 
@@ -65,22 +66,23 @@ The algorithm maps cleanly to GDScript:
 
 | TypeScript concept       | Godot equivalent                          |
 |--------------------------|-------------------------------------------|
-| `Map<string, Room>`      | `Dictionary` keyed by `Vector2i`          |
-| `floodGenerate(x,y,r)`   | BFS using `Array` as queue                |
-| `hasPassage(a,b)`        | Pure function, same hash logic            |
+| `RoomTemplate` interface | `Resource` subclass with cell/connector arrays |
+| `Map<string, PlacedRoom>` | `Dictionary` keyed by room ID |
+| `cellToRoom` Map         | `Dictionary` keyed by `Vector2i`          |
+| `floodGenerateRooms()`   | BFS using `Array` as queue                |
+| `placeRoomAtConnector()` | Same overlap-check + seeded shuffle logic |
 | WebSocket broadcast      | `MultiplayerSynchronizer` or `ENetMultiplayer` |
-| `explored` / `frontier`  | Two `Dictionary` sets on the server       |
 
 **Recommended Godot architecture:**
 1. Run the dungeon generator **only on the server** (authority node).
-2. Replicate only the `rooms` dict and `players` dict to clients.
-3. Call `floodGenerate` on `_on_player_moved` (server-side).
+2. Replicate only the room graph and player state to clients.
+3. Call `floodGenerateRooms` on `_on_player_moved` (server-side).
 4. Clients render whatever rooms they receive — no generation logic needed client-side.
 
 ## File Layout
 
 ```
-server.ts          — WebSocket server + dungeon generation logic
+server.ts          — WebSocket server + room template dungeon generation
 public/index.html  — Canvas renderer + keyboard input client
 package.json
 tsconfig.json
@@ -90,7 +92,9 @@ tsconfig.json
 
 | Constant              | Location     | Effect                                      |
 |-----------------------|--------------|---------------------------------------------|
-| `GENERATION_RADIUS`   | `server.ts`  | Rooms pre-generated ahead of each player    |
-| `hasPassage` threshold| `server.ts`  | 65 = open dungeon, lower = more dead ends   |
-| `CELL` / `ROOM`       | `index.html` | Visual scale of the rendered grid           |
-| `LERP_SPEED`          | `index.html` | Camera smoothing (0 = instant, 1 = no lerp) |
+| `GENERATION_RADIUS`   | `server.ts`  | Room-graph hops pre-generated ahead of player |
+| `GAP_FILL_THRESHOLD`  | `server.ts`  | Max Chebyshev distance for inter-player gap fill |
+| `GAP_FILL_MAX_STEPS`  | `server.ts`  | Cap on greedy fill iterations |
+| Template `weight`     | `server.ts`  | Selection bias per template (higher = more likely) |
+| `CELL`                | `index.html` | Visual scale of the rendered grid (px per cell) |
+| `LERP`                | `index.html` | Camera smoothing (lower = smoother) |
